@@ -1,0 +1,283 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 aufkrawall
+// SPDX-License-Identifier: MIT
+
+#include "fan_curve.h"
+
+static int clamp_int(int value, int minimum, int maximum) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+static void sort_enabled_points(FanCurvePoint* points, int count) {
+    for (int i = 1; i < count; i++) {
+        FanCurvePoint key = points[i];
+        int j = i - 1;
+        while (j >= 0 && points[j].temperatureC > key.temperatureC) {
+            points[j + 1] = points[j];
+            j--;
+        }
+        points[j + 1] = key;
+    }
+}
+
+void fan_curve_set_default(FanCurveConfig* config) {
+    if (!config) return;
+
+    memset(config, 0, sizeof(*config));
+    config->pollIntervalMs = 1000;
+    config->hysteresisC = 2;
+    config->zeroRpmHysteresisC = FAN_ZERO_RPM_DEFAULT_HYSTERESIS_C;
+
+    config->points[0] = { gc_bool8_from_bool(true), 30, 20 };
+    config->points[1] = { gc_bool8_from_bool(true), 45, 35 };
+    config->points[2] = { gc_bool8_from_bool(true), 60, 55 };
+    config->points[3] = { gc_bool8_from_bool(true), 72, 72 };
+    config->points[4] = { gc_bool8_from_bool(true), 84, 90 };
+    config->points[5] = { gc_bool8_from_bool(false), 90, 95 };
+    config->points[6] = { gc_bool8_from_bool(false), 95, 100 };
+    config->points[7] = { gc_bool8_from_bool(false), 100, 100 };
+}
+
+int fan_curve_active_count(const FanCurveConfig* config) {
+    if (!config) return 0;
+
+    int count = 0;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        if (config->points[i].enabled) count++;
+    }
+    return count;
+}
+
+// Everything fan_curve_normalize() does EXCEPT replacing a curve that has
+// fewer than two enabled points with the built-in default.
+//
+// Split out for the IPC trust boundary (F-01-002).  The boundary needs the
+// semantic half of the rule -- the 250 ms poll grid, the 0..100 clamps, the
+// sorted enabled points -- because it had none of it and accepted curves the
+// GUI rejects.  It must NOT inherit the default substitution: that turns "this
+// client sent an unusable curve" into "apply a five-point curve the client
+// never asked for", which is a hardware decision, and the boundary's job is to
+// make a request coherent, not to invent one.  `false` for `substituteDefault`
+// leaves an under-populated curve under-populated; the fan runtime then treats
+// it as it always has (fan_curve_interpolate_percent returns 100 for a curve
+// with no enabled point, which is the safe direction).
+static void fan_curve_normalize_impl(FanCurveConfig* config,
+                                     bool substituteDefault) {
+    if (!config) return;
+
+    config->pollIntervalMs = clamp_int(config->pollIntervalMs, 250, 5000);
+    config->pollIntervalMs = ((config->pollIntervalMs + 125) / 250) * 250;
+    config->hysteresisC = clamp_int(config->hysteresisC, 0, FAN_CURVE_MAX_HYSTERESIS_C);
+    config->zeroRpmEnabled = gc_bool8_from_bool(config->zeroRpmEnabled != 0);
+    config->zeroRpmHysteresisC = config->zeroRpmHysteresisC == 0
+        ? (gc_u8)FAN_ZERO_RPM_DEFAULT_HYSTERESIS_C
+        : (gc_u8)clamp_int((int)config->zeroRpmHysteresisC,
+            FAN_ZERO_RPM_MIN_HYSTERESIS_C,
+            FAN_ZERO_RPM_MAX_HYSTERESIS_C);
+    memset(config->zeroRpmReserved, 0, sizeof(config->zeroRpmReserved));
+    int normalizedPollIntervalMs = config->pollIntervalMs;
+    int normalizedHysteresisC = config->hysteresisC;
+    gc_bool8 normalizedZeroRpmEnabled = config->zeroRpmEnabled;
+    gc_u8 normalizedZeroRpmHysteresisC = config->zeroRpmHysteresisC;
+
+    FanCurvePoint enabled[FAN_CURVE_MAX_POINTS] = {};
+    FanCurvePoint disabled[FAN_CURVE_MAX_POINTS] = {};
+    int enabledCount = 0;
+    int disabledCount = 0;
+
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        config->points[i].temperatureC = clamp_int(config->points[i].temperatureC, 0, 100);
+        config->points[i].fanPercent = clamp_int(config->points[i].fanPercent, 0, 100);
+        if (config->points[i].enabled) enabled[enabledCount++] = config->points[i];
+        else disabled[disabledCount++] = config->points[i];
+    }
+
+    if (enabledCount < 2) {
+        if (!substituteDefault) return;
+        fan_curve_set_default(config);
+        config->pollIntervalMs = normalizedPollIntervalMs;
+        config->hysteresisC = normalizedHysteresisC;
+        config->zeroRpmEnabled = normalizedZeroRpmEnabled;
+        config->zeroRpmHysteresisC = normalizedZeroRpmHysteresisC;
+        return;
+    }
+
+    sort_enabled_points(enabled, enabledCount);
+
+    for (int i = 0; i < enabledCount; i++) {
+        config->points[i] = enabled[i];
+        config->points[i].enabled = true;
+    }
+    for (int i = 0; i < disabledCount; i++) {
+        config->points[enabledCount + i] = disabled[i];
+        config->points[enabledCount + i].enabled = false;
+    }
+    for (int i = enabledCount + disabledCount; i < FAN_CURVE_MAX_POINTS; i++) {
+        config->points[i] = { gc_bool8_from_bool(false), 100, 100 };
+    }
+}
+
+void fan_curve_normalize(FanCurveConfig* config) {
+    fan_curve_normalize_impl(config, true);
+}
+
+// The IPC trust boundary's entry point (F-01-002).  Same rule, minus the
+// default substitution -- see fan_curve_normalize_impl().
+void fan_curve_normalize_for_ipc(FanCurveConfig* config) {
+    fan_curve_normalize_impl(config, false);
+}
+
+void fan_curve_clamp_percentages(FanCurveConfig* config, int minPct, int maxPct) {
+    if (!config) return;
+    if (minPct < 0) minPct = 0;
+    if (maxPct > 100) maxPct = 100;
+    if (minPct > maxPct) minPct = maxPct;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        if (!config->points[i].enabled) continue;
+        if (config->points[i].fanPercent < minPct) config->points[i].fanPercent = minPct;
+        if (config->points[i].fanPercent > maxPct) config->points[i].fanPercent = maxPct;
+    }
+}
+
+bool fan_curve_validate(const FanCurveConfig* config, char* err, size_t errSize) {
+    if (!config) {
+        set_message(err, errSize, "No fan curve config");
+        return false;
+    }
+
+    if (config->pollIntervalMs < 250 || config->pollIntervalMs > 5000 || (config->pollIntervalMs % 250) != 0) {
+        set_message(err, errSize, "Fan curve poll interval must be 0.25s to 5.0s in 0.25s steps");
+        return false;
+    }
+    if (config->hysteresisC < 0 || config->hysteresisC > FAN_CURVE_MAX_HYSTERESIS_C) {
+        set_message(err, errSize, "Fan curve hysteresis must be between 0" GC_DEGREE "C and %d" GC_DEGREE "C", FAN_CURVE_MAX_HYSTERESIS_C);
+        return false;
+    }
+    if (config->zeroRpmEnabled > 1) {
+        set_message(err, errSize, "Fan curve native zero-RPM flag is invalid");
+        return false;
+    }
+    if (config->zeroRpmHysteresisC < FAN_ZERO_RPM_MIN_HYSTERESIS_C ||
+        config->zeroRpmHysteresisC > FAN_ZERO_RPM_MAX_HYSTERESIS_C) {
+        set_message(err, errSize,
+            "Zero-RPM fan-off gap must be between %d" GC_DEGREE "C and %d" GC_DEGREE "C",
+            FAN_ZERO_RPM_MIN_HYSTERESIS_C,
+            FAN_ZERO_RPM_MAX_HYSTERESIS_C);
+        return false;
+    }
+
+    FanCurvePoint active[FAN_CURVE_MAX_POINTS] = {};
+    int activeCount = 0;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        const FanCurvePoint* point = &config->points[i];
+        if (point->temperatureC < 0 || point->temperatureC > 100) {
+            set_message(err, errSize, "Fan curve temperatures must be between 0" GC_DEGREE "C and 100" GC_DEGREE "C");
+            return false;
+        }
+        if (point->fanPercent < 0 || point->fanPercent > 100) {
+            set_message(err, errSize, "Fan curve percentages must be between 0%% and 100%%");
+            return false;
+        }
+        if (point->enabled) active[activeCount++] = *point;
+    }
+
+    if (activeCount < 2) {
+        set_message(err, errSize, "Enable at least two fan curve points");
+        return false;
+    }
+
+    sort_enabled_points(active, activeCount);
+    for (int i = 1; i < activeCount; i++) {
+        if (active[i].temperatureC <= active[i - 1].temperatureC) {
+            set_message(err, errSize, "Enabled fan curve temperatures must be strictly increasing");
+            return false;
+        }
+        if (active[i].fanPercent < active[i - 1].fanPercent) {
+            set_message(err, errSize, "Enabled fan curve percentages must be nondecreasing");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int fan_curve_interpolate_percent(const FanCurveConfig* config, int temperatureC) {
+    if (!config) return 0;
+
+    FanCurvePoint active[FAN_CURVE_MAX_POINTS] = {};
+    int activeCount = 0;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        if (config->points[i].enabled) active[activeCount++] = config->points[i];
+    }
+
+    if (activeCount < 1) return 100;
+    sort_enabled_points(active, activeCount);
+    if (activeCount == 1) return clamp_int(active[0].fanPercent, 0, 100);
+
+    temperatureC = clamp_int(temperatureC, 0, 100);
+    if (temperatureC <= active[0].temperatureC) return clamp_int(active[0].fanPercent, 0, 100);
+    if (temperatureC >= active[activeCount - 1].temperatureC) return clamp_int(active[activeCount - 1].fanPercent, 0, 100);
+
+    for (int i = 1; i < activeCount; i++) {
+        const FanCurvePoint* left = &active[i - 1];
+        const FanCurvePoint* right = &active[i];
+        if (temperatureC > right->temperatureC) continue;
+        int span = right->temperatureC - left->temperatureC;
+        if (span <= 0) return clamp_int(right->fanPercent, 0, 100);
+        int offset = temperatureC - left->temperatureC;
+        int pct = left->fanPercent + (offset * (right->fanPercent - left->fanPercent) + span / 2) / span;
+        return clamp_int(pct, 0, 100);
+    }
+
+    return clamp_int(active[activeCount - 1].fanPercent, 0, 100);
+}
+
+void fan_curve_format_summary(const FanCurveConfig* config, char* buffer, size_t bufferSize) {
+    if (!buffer || bufferSize == 0) return;
+    if (!config) {
+        buffer[0] = 0;
+        return;
+    }
+
+    // gc_snprintf, not StringCchPrintfA: fan-curve math is shared platform-
+    // neutral code and is compiled into the Linux regression harness.
+    if (config->zeroRpmEnabled) {
+        int startC = fan_curve_first_enabled_temperature(config);
+        int stopC = startC - fan_curve_zero_rpm_hysteresis(config);
+        if (stopC < 0) stopC = 0;
+        gc_snprintf(buffer, bufferSize,
+            "%d pts | zero-RPM enabled | fan stop <=%d" GC_DEGREE
+            "C / start >=%d" GC_DEGREE "C | %.2fs",
+            fan_curve_active_count(config),
+            stopC, startC, (double)config->pollIntervalMs / 1000.0);
+    } else {
+        gc_snprintf(buffer, bufferSize, "%d pts | %.2fs | %d" GC_DEGREE "C hyst",
+            fan_curve_active_count(config),
+            (double)config->pollIntervalMs / 1000.0,
+            config->hysteresisC);
+    }
+}
+
+bool fan_curve_equals(const FanCurveConfig* lhs, const FanCurveConfig* rhs) {
+    if (!lhs || !rhs) return false;
+    if (lhs->pollIntervalMs != rhs->pollIntervalMs ||
+        lhs->hysteresisC != rhs->hysteresisC ||
+        lhs->zeroRpmEnabled != rhs->zeroRpmEnabled ||
+        lhs->zeroRpmHysteresisC != rhs->zeroRpmHysteresisC) return false;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        if (lhs->points[i].enabled != rhs->points[i].enabled) return false;
+        if (lhs->points[i].temperatureC != rhs->points[i].temperatureC) return false;
+        if (lhs->points[i].fanPercent != rhs->points[i].fanPercent) return false;
+    }
+    return true;
+}
+
+bool fan_curve_has_high_temp_low_fan_warning(const FanCurveConfig* config) {
+    if (!config) return false;
+    for (int i = 0; i < FAN_CURVE_MAX_POINTS; i++) {
+        if (!config->points[i].enabled) continue;
+        if (config->points[i].temperatureC >= 80 && config->points[i].fanPercent < 50) return true;
+    }
+    return false;
+}

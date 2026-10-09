@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "open-monitoring",
+  "outputfilename": "open-monitoring",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Alex Dedyura",
+    "email": "alex@dedyura.com"
+  },
+  "info": {
+    "companyName": "Alex Dedyura",
+    "productName": "Open Monitoring",
+    "productVersion": "0.6.2",
+    "copyright": "(c) 2026 Alex Dedyura. GPL-3.0",
+    "comments": "Open-source PC monitoring for Windows"
+  }
+}

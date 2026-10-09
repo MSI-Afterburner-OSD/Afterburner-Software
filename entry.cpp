@@ -1,0 +1,885 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 aufkrawall
+// SPDX-License-Identifier: MIT
+
+#include "log_redaction_policy.h"
+#include "single_instance_ready.h"
+#include "logon_handoff_status.h"
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+// CLI mode: --dump, --json, or --probe
+// Returns true if CLI handled (should exit), false if should run GUI
+static int g_cliExitCode = 0;
+
+static void set_main_window_title(HWND hwnd) {
+    if (!hwnd) return;
+    char title[128] = {};
+    StringCchPrintfA(title, ARRAY_COUNT(title), "%s v%s", APP_NAME, APP_VERSION);
+    SetWindowTextA(hwnd, title);
+}
+
+static bool handle_cli(LPWSTR wCmdLine) {
+    CliOptions opts = {};
+    if (!parse_cli_options(wCmdLine, &opts)) {
+        char err[256] = {};
+        const char* text = opts.error[0] ? opts.error : "Failed to parse CLI";
+        resolve_data_paths(err, sizeof(err));
+        write_text_file_atomic(cli_log_path(), text, strlen(text), err, sizeof(err));
+        // F-01-001: a mistyped command line is where silence is worst.
+        gc_cli_console_writef("ERROR: %s\n", text);
+        g_cliExitCode = 1;
+        return true;
+    }
+    if (opts.logonStart) {
+        set_default_config_path();
+        if (opts.hasConfigPath) StringCchCopyA(g_app.configPath, ARRAY_COUNT(g_app.configPath), opts.configPath);
+        debug_log("logon startup: parsed one-shot scheduled-task handoff (explicitConfig=%d elevated=%d)\n",
+            opts.hasConfigPath ? 1 : 0,
+            is_elevated() ? 1 : 0);
+
+        // Every scheduled invocation performs the authenticated,
+        // settings-free SERVICE_CMD_LOGON_HANDOFF before a silent exit.  The service
+        // derives the active account and configured profile from the pipe
+        // caller; the command-line config path is never authorization data.
+        char handoffResult[512] = {};
+        if (!service_client_logon_handoff(handoffResult,
+                sizeof(handoffResult))) {
+            char taskLog[768] = {};
+            char timestamp[64] = {};
+            format_log_timestamp_prefix(timestamp, sizeof(timestamp));
+            StringCchPrintfA(taskLog, ARRAY_COUNT(taskLog),
+                "%sGreen Curve logon handoff FAILED: %s\n",
+                timestamp,
+                handoffResult[0] ? handoffResult : "unknown service error");
+            char pathErr[256] = {};
+            char writeErr[256] = {};
+            if (resolve_data_paths(pathErr, sizeof(pathErr))) {
+                write_text_file_atomic(cli_log_path(), taskLog,
+                    strlen(taskLog), writeErr, sizeof(writeErr));
+            }
+            debug_log("logon startup: authenticated handoff failed: %s\n",
+                handoffResult[0] ? handoffResult : "unknown");
+            g_cliExitCode = 1;
+            return true;
+        }
+        debug_log("logon startup: authenticated service handoff succeeded: %s\n",
+            handoffResult[0] ? handoffResult : "accepted");
+
+        write_logon_handoff_accepted_status(handoffResult);
+        debug_log("logon startup: silent task delegated automatic profile application to service\n");
+        g_cliExitCode = 0;
+        return true;
+    }
+    if (opts.trayStart) {
+        set_default_config_path();
+        if (opts.hasConfigPath) StringCchCopyA(g_app.configPath, ARRAY_COUNT(g_app.configPath), opts.configPath);
+        if (!is_start_on_logon_enabled(g_app.configPath)) {
+            // A stale Run value must not resurrect tray residency after the user
+            // disabled it in config.  Normal GUI synchronization removes the
+            // stale value, while this defensive check makes the behavior safe.
+            debug_log("tray autostart: ignored stale --tray-start because start_program_on_logon is disabled\n");
+            g_cliExitCode = 0;
+            return true;
+        }
+        g_app.launchedFromLogon = true;
+        g_app.startHiddenToTray = true;
+        debug_log("tray autostart: accepted independent HKCU Run launch (explicitConfig=%d)\n",
+            opts.hasConfigPath ? 1 : 0);
+        return false;
+    }
+    if (!opts.recognized) return false;
+    set_default_config_path();
+    if (opts.hasConfigPath) StringCchCopyA(g_app.configPath, ARRAY_COUNT(g_app.configPath), opts.configPath);
+
+    // F-01-001: console sink first, so a caller is told even when the log file
+    // cannot be opened -- that case used to exit 0 in total silence.
+    gc_cli_console_ready();
+
+    char pathErr[256] = {};
+    resolve_data_paths(pathErr, sizeof(pathErr));
+    const char* logPath = cli_log_path();
+    // F-01-003: append, not truncate -- "w" meant a later --help erased the
+    // --service-install record. Bounded by the trim.
+    gc_cli_log_trim_if_oversized(logPath);
+    FILE* logf = gc_fopen_utf8(logPath, "a");
+    if (!logf) {
+        // The console sink keeps service commands usable without a file log.
+        gc_cli_console_write("WARNING: cannot open the Green Curve CLI log file; "
+                             "continuing without a file log.\n");
+    }
+
+    // flawfinder: ignore -- private macro; every invocation below has a literal format.
+    #define CLI_LOG(...) gc_cli_logf(logf, __VA_ARGS__)
+
+    CLI_LOG("Green Curve CLI mode started\n");
+
+    {
+        char message[1024] = {};
+        const char* remedy = "";
+        if (cli_handle_service_admin_command(&opts, &g_cliExitCode, message,
+                                             sizeof(message), &remedy)) {
+            CLI_LOG("%s\n", message);
+            if (remedy[0]) CLI_LOG("%s\n", remedy);
+            if (logf) fclose(logf);
+            return true;
+        }
+    }
+
+    // Upgrade settings transfer; the body lives with the verbs it drives.
+    if (opts.exportActiveSettings || opts.applySettingsFile) {
+        char result[512] = {};
+        bool noActive = false;
+        bool ok = cli_run_settings_transfer(&opts, result, sizeof(result), &noActive);
+        CLI_LOG("%s%s\n", (ok || noActive) ? "" : "ERROR: ",
+                result[0] ? result : "Settings transfer failed");
+        g_cliExitCode = ok ? 0 : (noActive ? GC_SETTINGS_TRANSFER_NO_ACTIVE_EXIT_CODE : 1);
+        if (logf) fclose(logf);
+        return true;
+    }
+
+    if (opts.startupTaskEnable || opts.startupTaskDisable) {
+        char err[256] = {};
+        bool ok = set_startup_task_enabled(opts.startupTaskEnable, err, sizeof(err));
+        if (ok) {
+            CLI_LOG("%s", opts.startupTaskEnable ? "Startup task enabled.\n" : "Startup task disabled.\n");
+            g_cliExitCode = 0;
+        } else {
+            CLI_LOG("ERROR: %s\n", err[0] ? err : "Startup task update failed");
+            g_cliExitCode = 1;
+        }
+        if (logf) fclose(logf);
+        return true;
+    }
+
+    // The machine-wide administrator commands all report the same way, so they
+    // share one dispatcher (main_cli_admin.cpp) instead of six copies of this.
+    {
+        bool adminOk = false;
+        char adminMessage[512] = {};
+        if (cli_handle_machine_admin_command(&opts, &adminOk, adminMessage, sizeof(adminMessage))) {
+            CLI_LOG("%s%s\n", adminOk ? "" : "ERROR: ", adminMessage);
+            g_cliExitCode = adminOk ? 0 : 1;
+            if (logf) fclose(logf);
+            return true;
+        }
+    }
+
+    if (opts.showHelp) {
+        cli_print_help(logf);
+        if (logf) fclose(logf);
+        return true;
+    }
+
+    // --self-test / --clk-domain-probe run BEFORE the service gate on purpose:
+    // they drive NvAPI directly in-process so they still diagnose a machine
+    // where the normal path does not work yet.  (--clk-domain-probe is opt-in
+    // and transiently writes/restores small clock offsets.)
+    if (opts.selfTest || opts.clkDomainProbe || opts.clkDomainDump) {
+        int probeExitCode = 0;
+        if (self_test_cli_dispatch(opts, logf ? logf : stdout,
+                                   &probeExitCode)) {
+            g_cliExitCode = probeExitCode;
+            // These write a structured REPORT whose documented purpose is to
+            // produce a file to attach, so the console gets the POINTER to it.
+            CLI_LOG("%s report written to %s (exit code %d)\n",
+                opts.selfTest ? "Self-test"
+                    : (opts.clkDomainDump ? "ClkDomains dump"
+                                          : "ClkDomains probe"),
+                logPath, probeExitCode);
+            if (logf) fclose(logf);
+            return true;
+        }
+    }
+
+    refresh_background_service_state();
+    bool needsService = opts.applyConfig || desired_has_any_action(&opts.desired) || opts.reset || opts.saveConfig || opts.dump || opts.json || opts.probe;
+    if (needsService && !g_app.backgroundServiceAvailable) {
+        CLI_LOG("ERROR: Background service is required for hardware operations but is not available.\n");
+        if (!g_app.backgroundServiceInstalled) {
+            CLI_LOG("Install it with: greencurve.exe --service-install\n");
+        } else if (!g_app.backgroundServiceRunning) {
+            CLI_LOG("The service is installed but not running. Start or reinstall it.\n");
+        } else {
+            CLI_LOG("The service is installed but not responding. Restart or reinstall it.\n");
+        }
+        if (logf) fclose(logf);
+        g_cliExitCode = 1;
+        return true;
+    }
+    if (g_app.backgroundServiceAvailable) {
+        ServiceResponse stateResponse = {};
+        char err[256] = {};
+        if (service_client_get_ready_state(&stateResponse, 2000,
+                "CLI initial state", err, sizeof(err))) {
+            apply_ready_service_envelope_to_app(&stateResponse);
+            CLI_LOG("Green Curve: Background service available. Using service-backed hardware control path.\n");
+        } else {
+            CLI_LOG("ERROR: %s\n", err[0] ? err : "Failed reading background service snapshot");
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    bool cliNeedsStableGpu = opts.applyConfig ||
+        desired_has_any_action(&opts.desired) || opts.reset || opts.saveConfig;
+    if (cliNeedsStableGpu) {
+        char gpuSelectionErr[256] = {};
+        if (!validate_configured_gpu_selection_for_client(
+                gpuSelectionErr, sizeof(gpuSelectionErr))) {
+            CLI_LOG("ERROR: %s\n", gpuSelectionErr[0] ? gpuSelectionErr :
+                "Configured GPU identity is unavailable");
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    if (opts.applyConfig) {
+        DesiredSettings cfg = {};
+        char err[256] = {};
+        // Determine which profile slot to apply
+        int logonSlot = get_config_int(g_app.configPath, "profiles", "logon_slot", 0);
+        if (logonSlot < 0 || logonSlot > CONFIG_NUM_SLOTS) logonSlot = 0;
+        if (logonSlot < 1 || logonSlot > CONFIG_NUM_SLOTS) {
+            CLI_LOG("ERROR: No valid logon profile slot is configured. Silent logon apply was skipped.\n");
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+        if (!is_profile_slot_saved(g_app.configPath, logonSlot)) {
+            CLI_LOG("ERROR: Logon profile slot %d is empty. Silent logon apply was skipped.\n", logonSlot);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+        if (!load_profile_from_config(g_app.configPath, logonSlot, &cfg, err, sizeof(err))) {
+            write_error_report_log_for_user_failure("CLI profile load failed", err);
+            CLI_LOG("ERROR: %s\n", err);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+        if (!desired_settings_have_explicit_state(&cfg, true, err, sizeof(err))) {
+            write_error_report_log_for_user_failure("CLI logon profile rejected", err);
+            CLI_LOG("ERROR: %s\n", err);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+
+        int profileCurvePoints = 0;
+        for (int i = 0; i < VF_NUM_POINTS; i++) {
+            if (cfg.hasCurvePoint[i]) profileCurvePoints++;
+        }
+        CLI_LOG("Green Curve: Profile summary gpu=%dMHz exclLow=%d lockCi=%d lockMHz=%u curvePoints=%d fanMode=%d\n",
+            cfg.gpuOffsetMHz,
+            cfg.gpuOffsetExcludeLowCount,
+            cfg.hasLock ? cfg.lockCi : -1,
+            cfg.hasLock ? cfg.lockMHz : 0u,
+            profileCurvePoints,
+            cfg.hasFan ? cfg.fanMode : -1);
+
+        CLI_LOG("Applying profile %d...\n", logonSlot);
+        merge_desired_settings(&cfg, &opts.desired);
+        char result[512] = {};
+        set_pending_operation_source("CLI apply-config");
+        debug_log("CLI apply-config: enabling reset-before-apply\n");
+        cfg.resetOcBeforeApply = true;
+        bool ok = apply_desired_settings(&cfg, false,
+            SERVICE_APPLY_ORIGIN_CLI, SERVICE_PROFILE_SOURCE_USER_SLOT, logonSlot,
+            result, sizeof(result));
+        CLI_LOG("%s\n", result);
+        if (!ok) {
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+        g_cliExitCode = 0;
+    } else if (desired_has_any_action(&opts.desired)) {
+        char result[512] = {};
+        set_pending_operation_source("CLI direct apply");
+        bool ok = apply_desired_settings(&opts.desired, false,
+            SERVICE_APPLY_ORIGIN_CLI, SERVICE_PROFILE_SOURCE_AD_HOC, 0,
+            result, sizeof(result));
+        CLI_LOG("%s\n", result);
+        if (!ok) {
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+        g_cliExitCode = 0;
+    }
+
+    if (opts.reset) {
+        char result[512] = {};
+        bool ok = service_client_reset(result, sizeof(result), nullptr);
+        CLI_LOG("%s\n", result);
+        if (!ok) {
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    if (opts.saveConfig) {
+        DesiredSettings saveDesired = {};
+        bool useDesired = false;
+        int targetSlot = get_config_int(g_app.configPath, "profiles", "selected_slot", CONFIG_DEFAULT_SLOT);
+        if (targetSlot < 1 || targetSlot > CONFIG_NUM_SLOTS) targetSlot = CONFIG_DEFAULT_SLOT;
+        char err[256] = {};
+        if (!refresh_service_snapshot_and_active_desired(err, sizeof(err))) {
+            CLI_LOG("ERROR: %s\n", err[0] ? err : "Failed to refresh background service state before save");
+            g_cliExitCode = 1;
+            if (logf) fclose(logf);
+            return true;
+        }
+        if (opts.applyConfig) {
+            if (!load_desired_settings_from_ini(g_app.configPath, &saveDesired, opts.error, sizeof(opts.error))) {
+                CLI_LOG("ERROR: %s\n", opts.error);
+                g_cliExitCode = 1;
+                if (logf) fclose(logf);
+                return true;
+            }
+            merge_desired_settings(&saveDesired, &opts.desired);
+            useDesired = true;
+        } else if (desired_has_any_action(&opts.desired)) {
+            saveDesired = opts.desired;
+            useDesired = true;
+        }
+        if (!useDesired) {
+            initialize_desired_settings_defaults(&saveDesired);
+            ControlState control = {};
+            bool haveControlState = get_effective_control_state(&control);
+            saveDesired.hasGpuOffset = true;
+            if (haveControlState && control_state_has_meaningful_gpu(&control)) {
+                saveDesired.gpuOffsetMHz = control.gpuOffsetMHz;
+                saveDesired.gpuOffsetExcludeLowCount = control.gpuOffsetExcludeLowCount;
+            } else {
+                resolve_displayed_live_gpu_offset_state_for_gui(&saveDesired.gpuOffsetMHz, &saveDesired.gpuOffsetExcludeLowCount);
+            }
+            saveDesired.hasMemOffset = true;
+            saveDesired.memOffsetMHz = haveControlState && control_state_has_meaningful_mem(&control) ? control.memOffsetMHz : mem_display_mhz_from_driver_khz(g_app.memClockOffsetkHz);
+            saveDesired.hasPowerLimit = true;
+            saveDesired.powerLimitPct = haveControlState && control_state_has_meaningful_power(&control) ? control.powerLimitPct : g_app.powerLimitPct;
+            saveDesired.hasFan = true;
+            saveDesired.fanMode = haveControlState && control_state_has_meaningful_fan(&control) ? control.fanMode : g_app.activeFanMode;
+            saveDesired.fanAuto = saveDesired.fanMode == FAN_MODE_AUTO;
+            saveDesired.fanPercent = haveControlState && control_state_has_meaningful_fan(&control) ? control.fanFixedPercent : g_app.activeFanFixedPercent;
+            copy_fan_curve(&saveDesired.fanCurve, haveControlState && control_state_has_meaningful_fan(&control) ? &control.fanCurve : &g_app.activeFanCurve);
+            for (int i = 0; i < VF_NUM_POINTS; i++) {
+                if (g_app.curve[i].freq_kHz > 0) {
+                    saveDesired.hasCurvePoint[i] = true;
+                    saveDesired.curvePointMHz[i] = displayed_curve_mhz(g_app.curve[i].freq_kHz); saveDesired.curvePointFromGpuOffset[i] = 0;
+                }
+            }
+        }
+        if (!save_profile_to_config(g_app.configPath, targetSlot, &saveDesired, err, sizeof(err))) {
+            CLI_LOG("ERROR: %s\n", err);
+            g_cliExitCode = 1;
+            if (logf) fclose(logf);
+            return true;
+        }
+        CLI_LOG("Profile %d written to %s\n", targetSlot, g_app.configPath);
+    }
+
+    if (opts.dump) {
+        char result[512] = {};
+        if (service_client_write_file_command(SERVICE_CMD_WRITE_LOG_SNAPSHOT, logPath, "client dump", result, sizeof(result))) {
+            CLI_LOG("VF curve dump written to %s\n", logPath);
+            CLI_LOG("%s\n", result);
+        } else {
+            CLI_LOG("ERROR: %s\n", result);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    if (opts.probe) {
+        char probePath[MAX_PATH] = {};
+        if (opts.hasProbeOutputPath) {
+            StringCchCopyA(probePath, ARRAY_COUNT(probePath), opts.probeOutputPath);
+        } else {
+            SYSTEMTIME now = {};
+            GetLocalTime(&now);
+            StringCchPrintfA(probePath, ARRAY_COUNT(probePath),
+                "greencurve_probe_%04u%02u%02u_%02u%02u%02u.json",
+                now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        }
+        char result[512] = {};
+        if (service_client_write_file_command(SERVICE_CMD_WRITE_PROBE_REPORT, probePath, "client probe", result, sizeof(result))) {
+            CLI_LOG("Probe report written to %s\n", probePath);
+            CLI_LOG("%s\n", result);
+        } else {
+            CLI_LOG("ERROR: %s\n", result);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    if (opts.json) {
+        const char* jsonPath = json_snapshot_path();
+        char result[512] = {};
+        if (service_client_write_file_command(SERVICE_CMD_WRITE_JSON_SNAPSHOT, jsonPath, "client json", result, sizeof(result))) {
+            CLI_LOG("JSON written to %s\n", jsonPath);
+            CLI_LOG("%s\n", result);
+        } else {
+            CLI_LOG("ERROR: %s\n", result);
+            if (logf) fclose(logf);
+            g_cliExitCode = 1;
+            return true;
+        }
+    }
+
+    CLI_LOG("\nGreen Curve CLI done.\n");
+    if (logf) fclose(logf);
+    #undef CLI_LOG
+    return true;
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, LPSTR /*lpCmdLine*/, int nCmdShow) {
+    LPWSTR wCmdLine = GetCommandLineW();
+    // Initialize the shared config lock before the service handoff path can read config.
+    enable_best_process_dpi_awareness();
+    init_dpi();
+    gui_service_model_initialize(&g_app.guiServiceModel);
+    initialize_process_mitigations();
+    InitializeCriticalSection(&g_debugLogLock);
+    debug_log_writer_start();
+    // No vectored NVML recovery in the GUI: resuming after an access violation
+    // only makes sense for the service, which restarts itself cleanly afterwards.
+    install_crash_handlers(false);
+
+    set_default_config_path();
+    char pathErr[256] = {};
+    resolve_data_paths(pathErr, sizeof(pathErr));
+    // Bound the GUI's own crash artifacts.  Runs after path resolution so it
+    // sweeps the real user directory rather than the environment fallback.
+    rotate_crash_artifacts_for_process();
+
+    // Initialize the remaining GUI-only process state before reading config/UI state.
+    initialize_dark_mode_support();
+
+    refresh_background_service_state();
+
+    char debugEnvBuf[16] = {};
+    DWORD debugEnvLen = GetEnvironmentVariableA(APP_DEBUG_ENV, debugEnvBuf, ARRAY_COUNT(debugEnvBuf));
+    bool debugEnvExplicitlyDisabled = (debugEnvLen > 0 && debugEnvBuf[0] == '0' && debugEnvBuf[1] == '\0');
+    bool debugEnvEnabled = (debugEnvLen > 0 && !debugEnvExplicitlyDisabled);
+    bool configExists = config_file_exists();
+    int configDebugEnabled = get_config_int(g_app.configPath, "debug", "enabled", APP_DEBUG_DEFAULT_ENABLED);
+    if (debugEnvExplicitlyDisabled) {
+        g_debug_logging = false;
+    } else {
+        g_debug_logging = debugEnvEnabled || (configDebugEnabled != 0);
+    }
+    if (g_debug_logging) {
+        g_debugSessionStartTickMs = GetTickCount64();
+        char configToken[32] = {};
+        gc_log_path_token(g_app.configPath, configToken, sizeof(configToken));
+        debug_log("debug enabled: env=%d configExists=%d configDebug=%d path=%s\n",
+            debugEnvEnabled ? 1 : 0,
+            configExists ? 1 : 0,
+            configDebugEnabled,
+            configToken);
+        debug_log_session_marker("BEGIN", "gui", wCmdLine ? "WinMain startup" : nullptr);
+        // The earlier status probe precedes config-controlled debug enable, so
+        // repeat it here for every normal debug log.  This is the diagnostic line
+        // needed to distinguish a task launch from a service-pipe readiness race.
+        char startupConfigToken[32] = {};
+        gc_log_path_token(g_app.configPath, startupConfigToken,
+                          sizeof(startupConfigToken));
+        debug_log("startup state: usingService=%d installed=%d running=%d available=%d broken=%d elevated=%d config=%s\n",
+            g_app.usingBackgroundService ? 1 : 0,
+            g_app.backgroundServiceInstalled ? 1 : 0,
+            g_app.backgroundServiceRunning ? 1 : 0,
+            g_app.backgroundServiceAvailable ? 1 : 0,
+            g_app.backgroundServiceBroken ? 1 : 0,
+            is_elevated() ? 1 : 0,
+            startupConfigToken);
+    }
+    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+
+    // CLI mode - handle --dump, --json, --help
+    if (handle_cli(wCmdLine)) {
+        debug_log_writer_stop();
+        // g_debugLogLock is process-lifetime; see cleanup_gui_process_runtime().
+        return g_cliExitCode;
+    }
+
+    g_app.hInst = hInstance;
+    g_app.guiFanMode = GUI_FAN_MODE_UNSET;
+
+    if (!acquire_single_instance_mutex()) {
+        return 0;
+    }
+
+    bool curveOk = false;
+    if (g_app.backgroundServiceInstalled && g_app.backgroundServiceAvailable) {
+        ServiceResponse stateResponse = {};
+        char err[256] = {};
+        if (!service_client_get_state_envelope(SERVICE_CMD_GET_SNAPSHOT,
+                &stateResponse, 2000, "GUI pre-window state",
+                err, sizeof(err))) {
+            g_app.backgroundServiceAvailable = false;
+            g_app.backgroundServiceBroken = true;
+            clear_service_authoritative_state();
+            curveOk = false;
+            debug_log("startup service snapshot failed: %s\n", err[0] ? err : "unknown");
+            set_profile_status_text("Background service is installed but not responding. Start or reinstall the service to restore GPU control.");
+        } else if (stateResponse.state.gpuPhase ==
+                SERVICE_GPU_PHASE_READY) {
+            apply_ready_service_envelope_to_app(&stateResponse);
+            curveOk = stateResponse.snapshot.loaded;
+        } else {
+            clear_service_authoritative_state();
+            debug_log("startup service state is coherent but not READY: phase=%u generation=%llu revision=%llu\n",
+                (unsigned int)stateResponse.state.gpuPhase,
+                (unsigned long long)stateResponse.state.gpuGeneration,
+                (unsigned long long)stateResponse.state.stateRevision);
+        }
+    } else {
+        clear_service_authoritative_state();
+        curveOk = false;
+    }
+
+    if (!curveOk && g_app.usingBackgroundService) {
+        g_app.loaded = false;
+        g_app.numPopulated = 0;
+        g_app.fanSupported = false;
+    }
+
+    if (g_app.backgroundServiceAvailable) {
+        char detail[128] = {};
+        refresh_global_state(detail, sizeof(detail));
+    }
+
+    // Migrate legacy config to profile slot format if needed
+    migrate_legacy_config_if_needed(g_app.configPath);
+
+    // Register window class
+    auto load_app_icon = [hInstance](int cx, int cy) -> HICON {
+        HICON icon = (HICON)LoadImageA(hInstance, MAKEINTRESOURCEA(APP_ICON_ID), IMAGE_ICON, cx, cy, LR_SHARED);
+        if (!icon) icon = LoadIcon(nullptr, IDI_APPLICATION);
+        return icon;
+    };
+
+    g_taskbarCreatedMessage = RegisterWindowMessageA("TaskbarCreated");
+
+    g_app.hWindowClassBrush = CreateSolidBrush(COL_BG);
+
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = APP_CLASS_NAME;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = g_app.hWindowClassBrush;
+    wc.hIcon = load_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    wc.style = 0;  // no CS_HREDRAW/CS_VREDRAW to reduce flicker
+
+    if (!RegisterClassExA(&wc)) {
+        MessageBoxA(nullptr, "Failed to register window class.", "Green Curve", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    // Create main window
+    SIZE initialSize = main_window_initial_size();
+    bool restoredPlacement = false;
+    RECT initialRect = main_window_initial_rect(initialSize, &restoredPlacement);
+    int winW = initialRect.right - initialRect.left;
+    int winH = initialRect.bottom - initialRect.top;
+    g_app.hMainWnd = CreateWindowExA(
+        0, APP_CLASS_NAME,
+        APP_NAME,
+        main_window_style(),
+        initialRect.left, initialRect.top,
+        winW, winH,
+        nullptr, nullptr, hInstance, nullptr
+    );
+    debug_log("main window created: placement=%s rect=%ld,%ld %dx%d\n",
+        restoredPlacement ? "restored" : "centered",
+        initialRect.left, initialRect.top, winW, winH);
+
+    signal_single_instance_window_ready();
+
+    // From here on, this thread pumps the main window. Record it so any
+    // synchronous service IPC that lands on it is loud in the log rather than
+    // showing up as an unexplained stutter in a user report.
+    note_gui_message_thread();
+
+    if (!g_app.hMainWnd) {
+        MessageBoxA(nullptr, "Failed to create window.", "Green Curve", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    allow_dark_mode_for_window(g_app.hMainWnd);
+    set_main_window_title(g_app.hMainWnd);
+
+    SendMessageA(g_app.hMainWnd, WM_SETICON, ICON_BIG, (LPARAM)wc.hIcon);
+    SendMessageA(g_app.hMainWnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIconSm);
+
+    auto load_tray_icon = [hInstance](int resourceId) -> HICON {
+        HICON icon = (HICON)LoadImageA(
+            hInstance,
+            MAKEINTRESOURCEA(resourceId),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            0);
+        if (!icon) icon = CopyIcon(LoadIcon(nullptr, IDI_APPLICATION));
+        return icon;
+    };
+    g_app.trayIcons[TRAY_ICON_STATE_DEFAULT] = load_tray_icon(TRAY_ICON_DEFAULT_ID);
+    g_app.trayIcons[TRAY_ICON_STATE_OC] = load_tray_icon(TRAY_ICON_OC_ID);
+    g_app.trayIcons[TRAY_ICON_STATE_FAN] = load_tray_icon(TRAY_ICON_FAN_ID);
+    g_app.trayIcons[TRAY_ICON_STATE_OC_FAN] = load_tray_icon(TRAY_ICON_OC_FAN_ID);
+    g_app.trayIcons[TRAY_ICON_STATE_PENDING] = load_tray_icon(TRAY_ICON_PENDING_ID);
+    g_app.trayIconState = TRAY_ICON_STATE_DEFAULT;
+
+    // Create buttons (positioned by create_edit_controls)
+    g_app.hApplyBtn = CreateWindowExA(
+        0, "BUTTON", "Apply Changes",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(110), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)APPLY_BTN_ID, hInstance, nullptr
+    );
+
+    g_app.hRefreshBtn = CreateWindowExA(
+        0, "BUTTON", "Refresh",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(90), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)REFRESH_BTN_ID, hInstance, nullptr
+    );
+
+    g_app.hResetBtn = CreateWindowExA(
+        0, "BUTTON", "Reset",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(90), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)RESET_BTN_ID, hInstance, nullptr
+    );
+
+    g_app.hLicenseBtn = CreateWindowExA(
+        0, "BUTTON", "License",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(80), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)LICENSE_BTN_ID, hInstance, nullptr
+    );
+
+    g_app.hUpdateBtn = CreateWindowExA(
+        0, "BUTTON", "Updates", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(84), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)UPDATE_BTN_ID, hInstance, nullptr);
+    g_app.hXbarAdvancedBtn = CreateWindowExA(
+        0, "BUTTON", "Advanced...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(100), dp(30),
+        g_app.hMainWnd, (HMENU)(INT_PTR)XBAR_ADVANCED_BTN_ID, hInstance, nullptr);
+
+    g_app.hProfileCombo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        0, 0, dp(156), dp(220),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_COMBO_ID, hInstance, nullptr
+    );
+    SendMessageA(g_app.hProfileCombo, CB_SETCURSEL, (WPARAM)(CONFIG_DEFAULT_SLOT - 1), 0);
+
+    g_app.hProfileLabel = CreateWindowExA(
+        0, "STATIC", "Profile slot:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(72), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_LABEL_ID, hInstance, nullptr
+    );
+
+    g_app.hProfileStateLabel = CreateWindowExA(
+        0, "STATIC", "",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(220), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_STATE_ID, hInstance, nullptr
+    );
+
+    g_app.hProfileLoadBtn = CreateWindowExA(
+        0, "BUTTON", "Load",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(65), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_LOAD_ID, hInstance, nullptr
+    );
+
+    g_app.hProfileSaveBtn = CreateWindowExA(
+        0, "BUTTON", "Save",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(65), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_SAVE_ID, hInstance, nullptr
+    );
+
+    g_app.hProfileClearBtn = CreateWindowExA(
+        0, "BUTTON", "Clear",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, dp(65), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_CLEAR_ID, hInstance, nullptr
+    );
+
+    g_app.hAppLaunchCombo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        0, 0, dp(170), dp(220),
+        g_app.hMainWnd, (HMENU)(INT_PTR)APP_LAUNCH_COMBO_ID, hInstance, nullptr
+    );
+    SendMessageA(g_app.hAppLaunchCombo, CB_SETCURSEL, 0, 0);
+
+    g_app.hAppLaunchLabel = CreateWindowExA(
+        0, "STATIC", "Apply profile on GUI start:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(170), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)APP_LAUNCH_LABEL_ID, hInstance, nullptr
+    );
+
+    g_app.hLogonCombo = CreateWindowExA(
+        0, "COMBOBOX", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        0, 0, dp(170), dp(220),
+        g_app.hMainWnd, (HMENU)(INT_PTR)LOGON_COMBO_ID, hInstance, nullptr
+    );
+    SendMessageA(g_app.hLogonCombo, CB_SETCURSEL, 0, 0);
+
+    g_app.hLogonLabel = CreateWindowExA(
+        0, "STATIC", "Apply profile at Windows logon:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(208), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)LOGON_LABEL_ID, hInstance, nullptr
+    );
+
+    g_app.hProfileStatusLabel = CreateWindowExA(
+        0, "STATIC", "",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(420), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)PROFILE_STATUS_ID, hInstance, nullptr
+    );
+
+    // F-CHECKBOX-HIT  The caption lives inside the BUTTON, not in a neighbouring
+    // STATIC that forwards STN_CLICKED.  That split left the gap between box and
+    // text dead, and a disabled STATIC is painted by user32 in the system
+    // grey-text colour regardless of WM_CTLCOLORSTATIC, so the greyed caption did
+    // not match any other label in the dark window.  layout_main_window() then
+    // fits the control to its own text so nothing past the caption is clickable.
+    g_app.hStartOnLogonCheck = CreateWindowExA(
+        0, "BUTTON", "Start minimized to tray at logon",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, dp(220), dp(20),
+        g_app.hMainWnd, (HMENU)(INT_PTR)START_ON_LOGON_CHECK_ID, hInstance, nullptr
+    );
+
+    // "Share with all users" checkbox (admin): publishes the SELECTED profile
+    // slot to the shared bank and sets it as the all-users default logon
+    // profile in one action.  Label is set dynamically ("Share slot N with all
+    // users") by update_share_all_users_check_state().  Right-click opens an
+    // advanced menu for managing the shared bank without changing the default.
+    g_app.hShareAllUsersCheck = CreateWindowExA(
+        0, "BUTTON", "Share with all users",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, dp(240), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)SHARE_ALL_USERS_CHECK_ID, hInstance, nullptr
+    );
+    if (g_app.hShareAllUsersCheck) {
+        SetWindowSubclass(g_app.hShareAllUsersCheck, share_all_users_subclass_proc, 0, 0);
+    }
+    debug_log("main window: share-with-all-users checkbox created (hwnd=%p)\n", (void*)g_app.hShareAllUsersCheck);
+
+    // "Shared profiles" button (any user): lists the admin-published shared
+    // profiles and loads the chosen one into the editor read-only, so a
+    // restricted user can apply the admin's profile on demand (not just on logon).
+    g_app.hSharedProfilesBtn = CreateWindowExA(
+        0, "BUTTON", "Shared profiles...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, dp(150), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)SHARED_PROFILES_BTN_ID, hInstance, nullptr
+    );
+    debug_log("main window: shared-profiles button created (hwnd=%p)\n", (void*)g_app.hSharedProfilesBtn);
+
+    // "Auto-Profiles" button: opens the same Profiles popup as the tray submenu
+    // (per-slot apply + auto-switch toggle + "Configure auto-profiles...").
+    g_app.hAutoProfilesBtn = CreateWindowExA(
+        0, "BUTTON", "Auto-Profiles...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, dp(160), dp(22),
+        g_app.hMainWnd, (HMENU)(INT_PTR)AUTO_PROFILE_BTN_ID, hInstance, nullptr
+    );
+
+    // Same F-CHECKBOX-HIT conversion; the caption also switches to
+    // "... (repair needed)", so update_background_service_controls() re-fits it.
+    g_app.hServiceEnableCheck = CreateWindowExA(
+        0, "BUTTON", "Background service installed",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, dp(300), dp(20),
+        g_app.hMainWnd, (HMENU)(INT_PTR)SERVICE_ENABLE_CHECK_ID, hInstance, nullptr
+    );
+    g_app.hServiceStatusLabel = CreateWindowExA(
+        0, "STATIC", "",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(460), dp(18),
+        g_app.hMainWnd, (HMENU)(INT_PTR)SERVICE_STATUS_ID, hInstance, nullptr
+    );
+
+    g_app.hLogonHintLabel = CreateWindowExA(
+        0, "STATIC",
+        "OC, UV, power, and custom fan control require the background service.\r\nWhen the service is unavailable, live tuning controls stay disabled until it is running again.",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        0, 0, dp(900), dp(34),
+        g_app.hMainWnd, (HMENU)(INT_PTR)LOGON_HINT_ID, hInstance, nullptr
+    );
+
+    apply_ui_font_to_children(g_app.hMainWnd);
+
+    layout_bottom_buttons(g_app.hMainWnd);
+
+    // Create edit controls
+    create_edit_controls(g_app.hMainWnd, hInstance);
+    ensure_tray_icon();
+    if (!g_app.startHiddenToTray && g_app.backgroundServiceAvailable) {
+        if (!show_gpu_support_warnings(g_app.hMainWnd)) {
+            cleanup_gui_process_runtime(false);
+            return 0;
+        }
+    }
+    gui_service_begin_full_sync("initial window state");
+    apply_logon_startup_behavior();
+    if (g_app.usingBackgroundService && g_app.backgroundServiceBroken) {
+        set_profile_status_text("Background service is installed but not responding. Start or reinstall the service to restore GPU control.");
+    }
+    // A successful snapshot already synchronized the personal-slot checkmark
+    // from explicit service metadata.  Without an authoritative service, clear
+    // stale prior-process ownership before an optional app-launch apply can
+    // establish a new active slot.
+    if (!g_app.backgroundServiceAvailable) {
+        sync_applied_profile_from_service_metadata();
+    }
+    // App-start evaluation needs preconditions from the first READY envelope.
+    g_app.appLaunchEvaluationPending = true;
+    invalidate_main_window();
+
+    if (g_app.startHiddenToTray) {
+        hide_main_window_to_tray();
+    } else {
+        show_window_with_primed_first_frame(g_app.hMainWnd, nCmdShow);
+    }
+
+    schedule_logon_combo_sync();
+
+    // Replay settings captured by an in-app update, if any (detached child).
+    gui_update_replay_pending_restore();
+
+    // Message loop
+    MSG msg = {};
+    while (GetMessageA(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    cleanup_gui_process_runtime(true);
+
+    return (int)msg.wParam;
+}

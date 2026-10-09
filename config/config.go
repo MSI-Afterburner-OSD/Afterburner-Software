@@ -1,0 +1,363 @@
+// Package config stores user settings as JSON in the app's data directory —
+// a hidden ".open-monitoring" folder next to the executable, so the app is
+// fully portable and leaves nothing behind in AppData or the registry.
+//
+// Settings are small, read once at startup and written on every change, so the
+// whole file is loaded and saved as a unit. Load never fails: a missing or
+// corrupt file falls back to defaults, because refusing to start over an
+// unreadable preferences file would be worse than losing the preferences.
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+)
+
+// currentVersion is bumped whenever a stored file needs fixing up on load.
+// See migrate for what each step does.
+const currentVersion = 10
+
+type Config struct {
+	Version          int     `json:"version"`
+	SampleIntervalMs int     `json:"sampleIntervalMs"`
+	MaxRecordMinutes int     `json:"maxRecordMinutes"`
+	Theme            string  `json:"theme"`   // dark | light
+	UiScale          float64 `json:"uiScale"` // 0 = follow the Windows display scaling
+
+	// Lang is the interface language: "auto" follows the Windows locale, which
+	// is what a fresh install does. Only the frontend reads it — every string
+	// the backend produces travels as a key the UI translates, so there is no
+	// second copy of this decision on the Go side.
+	Lang string `json:"lang"` // auto | en | ru
+
+	// UpdateCheck enables the daily background look at GitHub releases. The
+	// manual check in About works either way.
+	UpdateCheck bool `json:"updateCheck"`
+
+	// KeepSessionsDays deletes finished recordings older than this on startup.
+	// 0 keeps everything forever, which is the default — the app must never
+	// discard user data unless asked to.
+	KeepSessionsDays int `json:"keepSessionsDays"`
+
+	Alerts AlertsConfig `json:"alerts"`
+	Hud    HudConfig    `json:"hud"`
+}
+
+// AlertsConfig holds the notification thresholds. A threshold of 0 disables
+// that one rule; Enabled switches the whole feature.
+type AlertsConfig struct {
+	Enabled     bool    `json:"enabled"`
+	CPUTempC    float64 `json:"cpuTempC"`
+	GPUTempC    float64 `json:"gpuTempC"`
+	RAMPercent  float64 `json:"ramPercent"`
+	DiskPercent float64 `json:"diskPercent"` // used space per volume
+}
+
+type HudConfig struct {
+	Metrics          []string `json:"metrics"` // enabled row keys, grouped into sections by the UI
+	Opacity          float64  `json:"opacity"` // 0.2 .. 1
+	Anchor           string   `json:"anchor"`  // free | tl | tr | bl | br
+	X                int      `json:"x"`
+	Y                int      `json:"y"`
+	W                int      `json:"w"`
+	H                int      `json:"h"`
+	FsAlertDismissed bool     `json:"fsAlertDismissed"` // "exclusive fullscreen hides the HUD" notice
+
+	// ClickThrough makes the overlay invisible to the mouse: clicks land on
+	// the game underneath. Toggled live with its hotkey, since a click-through
+	// window cannot be clicked back to normal.
+	ClickThrough bool `json:"clickThrough"`
+
+	// System-wide shortcuts, as "Ctrl+Alt+H". They are claimed globally, so
+	// they carry modifiers: a bare letter would be swallowed everywhere on the
+	// machine, including inside the game the HUD is watching.
+	HotkeyToggle       string `json:"hotkeyToggle"`       // show/hide the overlay
+	HotkeyReset        string `json:"hotkeyReset"`        // restart average and lows
+	HotkeyClickThrough string `json:"hotkeyClickThrough"` // mouse passes through the overlay
+}
+
+// Hotkey defaults. Ctrl+Alt is free of Windows' own bindings and of the usual
+// in-game ones, and the letters match what they do: HUD, Benchmark, Through.
+const (
+	DefaultHotkeyToggle       = "Ctrl+Alt+H"
+	DefaultHotkeyReset        = "Ctrl+Alt+B"
+	DefaultHotkeyClickThrough = "Ctrl+Alt+T"
+)
+
+// Overlay width bounds, exposed because Settings renders the slider over them.
+// The height is not a setting: the HUD measures its own contents and asks the
+// window to match (see app.FitHudSize).
+const (
+	HudMinWidth = 240
+	HudMaxWidth = 520
+)
+
+// defaultHudMetrics mirrors a classic in-game OSD: a GPU block, a CPU block,
+// memory, and frame rate, each rendered as a titled section.
+func defaultHudMetrics() []string {
+	return []string{
+		"gpu", "gpuTemp", "gpuClock", "gpuMemClock", "gpuPow", "vram",
+		"cpu", "cpuTemp", "cpuClock", "cpuPow",
+		"ram", "ramLoad", "ramSpeed",
+		"fps", "fpsAvg", "fpsLow1", "fpsLow01", "frameGraph", "fpsGraph",
+	}
+}
+
+func Default() Config {
+	return Config{
+		Version:          currentVersion,
+		SampleIntervalMs: 1000,
+		MaxRecordMinutes: 240,
+		Theme:            "dark",
+		UiScale:          0, // match Windows
+		Lang:             "auto",
+		UpdateCheck:      true,
+		KeepSessionsDays: 0, // keep forever
+		Alerts: AlertsConfig{
+			// On by default with values that mean "something is actually wrong",
+			// not "the machine is under load" — a monitoring app that cries wolf
+			// gets its notifications disabled within a day.
+			Enabled:     true,
+			CPUTempC:    95,
+			GPUTempC:    90,
+			RAMPercent:  95,
+			DiskPercent: 95,
+		},
+		Hud: HudConfig{
+			Metrics:            defaultHudMetrics(),
+			Opacity:            0.85,
+			Anchor:             "free",
+			X:                  40,
+			Y:                  40,
+			W:                  320,
+			H:                  620,
+			HotkeyToggle:       DefaultHotkeyToggle,
+			HotkeyReset:        DefaultHotkeyReset,
+			HotkeyClickThrough: DefaultHotkeyClickThrough,
+		},
+	}
+}
+
+var (
+	dirOnce sync.Once
+	dirPath string
+)
+
+// Dir is the app's data directory: a hidden ".open-monitoring" folder next to
+// the executable, shared by the config, the session database and the unpacked
+// helpers. A portable copy and an installed one follow the same rule — the
+// data always travels with the exe. Created on first use, and files from the
+// pre-portable AppData home are pulled in once.
+func Dir() string {
+	dirOnce.Do(func() {
+		base := "."
+		if exe, err := os.Executable(); err == nil {
+			base = filepath.Dir(exe)
+		}
+		dirPath = filepath.Join(base, ".open-monitoring")
+		os.MkdirAll(dirPath, 0o755)
+		hide(dirPath)
+		migrateLegacyDir(dirPath)
+	})
+	return dirPath
+}
+
+// migrateLegacyDir moves files saved by versions that kept their data in
+// %AppData%\OpenMonitoring, then clears out that home and the old helper
+// cache. Helpers re-unpack on demand, so only the data files are carried over.
+func migrateLegacyDir(dir string) {
+	if base, err := os.UserCacheDir(); err == nil {
+		os.RemoveAll(filepath.Join(base, "OpenMonitoring")) // unpacked helpers only
+	}
+
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return
+	}
+	old := filepath.Join(base, "OpenMonitoring")
+	entries, err := os.ReadDir(old)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		src, dst := filepath.Join(old, e.Name()), filepath.Join(dir, e.Name())
+		if _, err := os.Stat(dst); err == nil || e.IsDir() {
+			continue // never overwrite data the new home already has
+		}
+		if os.Rename(src, dst) != nil {
+			// Rename fails across volumes; fall back to copy + delete.
+			if data, err := os.ReadFile(src); err == nil && os.WriteFile(dst, data, 0o644) == nil {
+				os.Remove(src)
+			}
+		}
+	}
+	os.Remove(old) // only succeeds once empty, which is the point
+}
+
+func path() string { return filepath.Join(Dir(), "config.json") }
+
+// Load reads the stored settings, falling back to defaults for anything
+// missing, out of range, or unreadable.
+func Load() Config {
+	cfg := Default()
+
+	data, err := os.ReadFile(path())
+	if err != nil {
+		return cfg // first run
+	}
+
+	// Unmarshalling over the defaults means absent keys keep their default.
+	// Version has to start at zero for that same reason: a file written before
+	// the field existed must read as v0 so its migrations still run.
+	cfg.Version = 0
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Default() // corrupt; better to reset than to start half-configured
+	}
+
+	stored := cfg.Version
+	Clamp(&cfg)
+	migrate(&cfg, stored)
+
+	if stored < currentVersion {
+		cfg.Version = currentVersion
+		Save(cfg)
+	}
+	return cfg
+}
+
+// Clamp forces every value back into its supported range. It guards the two
+// ways an invalid value can arrive: a hand-edited or downgraded file on load,
+// and a frontend save.
+func Clamp(cfg *Config) {
+	if cfg.SampleIntervalMs < 250 {
+		cfg.SampleIntervalMs = 250
+	}
+	if cfg.MaxRecordMinutes < 1 || cfg.MaxRecordMinutes > 240 {
+		cfg.MaxRecordMinutes = 240
+	}
+	if cfg.Hud.Opacity < 0.2 || cfg.Hud.Opacity > 1 {
+		cfg.Hud.Opacity = 0.85
+	}
+	if cfg.Theme != "light" {
+		cfg.Theme = "dark"
+	}
+	switch cfg.UiScale {
+	case 0, 1, 1.25, 1.5, 2:
+	default:
+		cfg.UiScale = 0
+	}
+	// Empty is how a file written before the setting existed reads, and "auto"
+	// is what it should mean.
+	switch cfg.Lang {
+	case "en", "ru":
+	default:
+		cfg.Lang = "auto"
+	}
+	switch cfg.Hud.Anchor {
+	case "free", "tl", "tr", "bl", "br":
+	default:
+		cfg.Hud.Anchor = "free"
+	}
+	// The overlay window cannot be resized by hand — it fits itself to the rows
+	// the user enabled — so its width is a setting, and the only size the
+	// frontend never gets to decide. Narrower than this and the value column
+	// collides with its label; wider and it stops being an overlay.
+	if cfg.Hud.W < HudMinWidth || cfg.Hud.W > HudMaxWidth {
+		cfg.Hud.W = Default().Hud.W
+	}
+	// The height is written by the overlay itself, so this only has to catch a
+	// hand-edited file; the real bound is the work area, which app.FitHudSize
+	// applies on the way in.
+	if cfg.Hud.H < 90 || cfg.Hud.H > 4000 {
+		cfg.Hud.H = Default().Hud.H
+	}
+
+	// An empty combination is how a file written before these existed reads,
+	// and also the only way to end up with an unregisterable shortcut.
+	if cfg.Hud.HotkeyToggle == "" {
+		cfg.Hud.HotkeyToggle = DefaultHotkeyToggle
+	}
+	if cfg.Hud.HotkeyReset == "" {
+		cfg.Hud.HotkeyReset = DefaultHotkeyReset
+	}
+	if cfg.Hud.HotkeyClickThrough == "" {
+		cfg.Hud.HotkeyClickThrough = DefaultHotkeyClickThrough
+	}
+
+	if cfg.KeepSessionsDays < 0 || cfg.KeepSessionsDays > 3650 {
+		cfg.KeepSessionsDays = 0
+	}
+
+	// Thresholds: 0 disables a rule, anything else is forced into a range
+	// where the alert can both fire and stay quiet on a healthy machine.
+	clampThreshold(&cfg.Alerts.CPUTempC, 40, 110)
+	clampThreshold(&cfg.Alerts.GPUTempC, 40, 110)
+	clampThreshold(&cfg.Alerts.RAMPercent, 50, 100)
+	clampThreshold(&cfg.Alerts.DiskPercent, 50, 100)
+}
+
+func clampThreshold(v *float64, min, max float64) {
+	if *v == 0 {
+		return
+	}
+	if *v < min {
+		*v = min
+	}
+	if *v > max {
+		*v = max
+	}
+}
+
+// migrate fixes up a file written by an older version. Each step is written to
+// be safe to apply to anything older than it, since a user may skip releases.
+func migrate(cfg *Config, from int) {
+	// v3 reorganised the HUD into grouped sections with a new set of row keys,
+	// so an older selection no longer refers to anything that exists.
+	if from < 3 {
+		cfg.Hud.Metrics = defaultHudMetrics()
+		cfg.Hud.W, cfg.Hud.H = 320, 560
+	}
+
+	// v5 added the HUD sparklines and made the interface follow the Windows
+	// display scaling. An install still pinned at 100% was only there because
+	// that used to be the default, so move it onto the automatic behaviour.
+	if from < 5 {
+		if cfg.UiScale == 1 {
+			cfg.UiScale = 0
+		}
+		for _, key := range []string{"frameGraph", "fpsGraph"} {
+			if !slices.Contains(cfg.Hud.Metrics, key) {
+				cfg.Hud.Metrics = append(cfg.Hud.Metrics, key)
+			}
+		}
+		if cfg.Hud.H < 620 {
+			cfg.Hud.H = 620 // room for the graphs
+		}
+	}
+
+	// v6 dropped the WinRing0 opt-in and the LibreHardwareMonitor URL: the
+	// sensor helper no longer installs a kernel driver, so there is nothing
+	// left to opt into. Both keys simply disappear on the next save.
+	//
+	// v7 added the dismissible PawnIO prompt; v8 made the driver mandatory,
+	// so the pawnIoPromptDismissed key disappears on the next save — the app
+	// now blocks on the install gate instead of asking politely.
+	//
+	// v9 added the HUD hotkeys. Clamp already fills an empty combination with
+	// the default, so the bump exists only to write the new keys into the file.
+	//
+	// v10 added the update check, alerts, session retention and click-through.
+	// Load unmarshals over Default(), so absent keys already read as their
+	// defaults — the bump only writes the new keys into the file.
+}
+
+func Save(cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path(), data, 0o644)
+}
